@@ -132,7 +132,8 @@ def fetch(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
 # ── FINN.NO SCRAPING ─────────────────────────────────────────────────────────
 
 def get_search_listing_ids() -> List[Dict]:
-    """Henter alle finn_id + URL fra søkesiden via finnkode i lenker."""
+    """Henter alle finn_id + basisdata fra søkesiden. Finn.no søkeresultater
+    inneholder allerede: adresse, pris, boligtype, soverom, areal, meglernavn."""
     listings = []
     page = 1
 
@@ -142,12 +143,12 @@ def get_search_listing_ids() -> List[Dict]:
         soup = fetch(url)
 
         if not soup:
-            log.error(f"Klarte ikke hente søkeside {page} — avslutter paginering")
+            log.error(f"Klarte ikke hente søkeside {page}")
             break
 
-        # Finn alle lenker som inneholder finnkode= i href
+        # Hent alle lenker med finnkode
         all_links = soup.find_all("a", href=re.compile(r"finnkode=\d+"))
-        log.info(f"  Fant {len(all_links)} lenker med finnkode på side {page}")
+        log.info(f"  Fant {len(all_links)} finnkode-lenker på side {page}")
 
         seen_on_page = set()
         for link in all_links:
@@ -161,28 +162,29 @@ def get_search_listing_ids() -> List[Dict]:
             seen_on_page.add(finn_id)
 
             full_url = href if href.startswith("http") else "https://www.finn.no" + href
-            listings.append({"finn_id": finn_id, "listing_url": full_url})
+
+            # Hent foreldreelement (article-kortet) for å trekke ut basisdata
+            article = link.find_parent("article")
+            card_data = extract_card_data(finn_id, full_url, article or link)
+            listings.append(card_data)
 
         log.info(f"  {len(seen_on_page)} unike annonser på side {page}")
 
         if not seen_on_page:
-            log.info(f"Ingen annonser funnet på side {page} — stopper paginering")
             break
 
-        # Sjekk om det finnes neste side
         next_btn = (
             soup.select_one("a[aria-label='Neste side']")
             or soup.select_one("a[aria-label='Next page']")
             or soup.select_one("[data-testid='pagination-next-page']")
         )
         if not next_btn or not next_btn.get("href"):
-            log.info(f"Ingen neste side funnet — ferdig med paginering")
             break
 
         page += 1
         time.sleep(REQUEST_DELAY)
 
-    # Dedupliser på tvers av sider
+    # Dedupliser
     seen = set()
     unique = []
     for item in listings:
@@ -192,6 +194,200 @@ def get_search_listing_ids() -> List[Dict]:
 
     log.info(f"Totalt {len(unique)} unike annonser funnet")
     return unique
+
+
+def extract_card_data(finn_id: str, url: str, element) -> Dict:
+    """Trekker ut basisdata fra et søkeresultat-kort."""
+    data = {"finn_id": finn_id, "listing_url": url}
+
+    if element is None:
+        return data
+
+    text = element.get_text(separator="\n", strip=True)
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    # Adresse — linjen etter tittelen (h2)
+    h2 = element.find("h2")
+    if h2:
+        title_text = h2.get_text(strip=True)
+        data["name"] = title_text
+        # Adresse er neste linje etter tittelen
+        try:
+            h2_idx = lines.index(title_text)
+            if h2_idx + 1 < len(lines):
+                data["address"] = lines[h2_idx + 1]
+        except ValueError:
+            pass
+
+    # Pris — "N NNN NNN kr" mønster
+    for line in lines:
+        price_match = re.search(r"(\d[\d\s]{4,})\s*kr", line)
+        if price_match:
+            val = parse_int(price_match.group(1))
+            if val and val > 100_000:
+                if not data.get("listing_price"):
+                    data["listing_price"] = val
+                break
+
+    # Totalpris
+    for line in lines:
+        if "totalpris" in line.lower():
+            m = re.search(r"[Tt]otalpris[:\s]+(\d[\d\s]+)\s*kr", line)
+            if m:
+                data["total_price"] = parse_int(m.group(1))
+            break
+
+    # Areal — "NNN m²"
+    for line in lines:
+        m = re.search(r"(\d+)\s*m²", line)
+        if m:
+            val = int(m.group(1))
+            if val > 10:
+                data["usable_area_sqm"] = val
+                break
+
+    # Boligtype
+    for line in lines:
+        for btype in ["Enebolig", "Tomannsbolig", "Leilighet", "Rekkehus",
+                      "Gårdsbruk", "Fritidsbolig", "Tomt"]:
+            if btype.lower() in line.lower():
+                data["property_type"] = btype
+                break
+
+    # Soverom
+    for line in lines:
+        m = re.search(r"(\d+)\s*soverom", line, re.IGNORECASE)
+        if m:
+            data["bedrooms"] = int(m.group(1))
+            break
+
+    # Meglernavn — logo img alt-tekst eller tekst nær logoen
+    megler_img = element.select_one("img[alt*='logo'], img[alt*='Megler'], img[alt*='megler']")
+    if megler_img:
+        alt = megler_img.get("alt", "")
+        if "logo" in alt.lower():
+            # Hent tekst rett etter logoen
+            parent = megler_img.find_parent()
+            if parent:
+                sibling_text = parent.get_text(strip=True)
+                if sibling_text and len(sibling_text) > 3:
+                    data["realtor_agency"] = sibling_text
+    
+    # Fallback megler fra tekst
+    if not data.get("realtor_agency"):
+        for line in lines:
+            if any(word in line for word in ["Eiendomsmegling", "Eiendomsmegler", "Megling",
+                                              "Advokatfirma", "Eiendom AS"]):
+                data["realtor_agency"] = line
+                break
+
+    # Solgt-status fra søkelisten
+    if any("solgt" in l.lower() for l in lines[:5]):
+        data["_presold"] = True
+
+    log.info(f"  Kortdata {finn_id}: {data.get('address','?')} — {data.get('listing_price','?')} kr")
+    return data
+
+
+def get_listing_details(finn_id: str, url: str, base_data: Dict = None) -> Dict:
+    """Henter tilleggsdetaljer fra individuell annonseside.
+    base_data inneholder allerede det vi fikk fra søkeresultatsiden."""
+    if not url:
+        url = f"https://www.finn.no/realestate/homes/ad.html?finnkode={finn_id}"
+
+    soup = fetch(url)
+    if not soup:
+        return base_data or {"finn_id": finn_id, "listing_url": url, "_error": True}
+
+    data = dict(base_data) if base_data else {"finn_id": finn_id, "listing_url": url}
+
+    # Hent all tekst for mønstermatch
+    full_text = soup.get_text(separator="\n", strip=True)
+    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+
+    def find_value_after_label(label: str, transform=str) -> Optional[str]:
+        """Finn verdien på linjen etter en etikett."""
+        label_lower = label.lower()
+        for i, line in enumerate(lines):
+            if line.lower().strip() == label_lower and i + 1 < len(lines):
+                val = lines[i + 1]
+                try:
+                    return transform(val)
+                except Exception:
+                    return val
+        return None
+
+    # Nøkkelinfo-felt via etikett→neste linje mønster
+    fields = {
+        "Internt bruksareal":  ("primary_area_sqm", parse_int),
+        "Bruksareal":          ("usable_area_sqm",  parse_int),
+        "Byggeår":             ("year_built",        parse_int),
+        "Tomteareal":          ("plot_size_sqm",     parse_int),
+        "Tomtestørrelse":      ("plot_size_sqm",     parse_int),
+        "Antall bad":          ("bathrooms",         parse_int),
+        "Bad":                 ("bathrooms",         parse_int),
+        "Etasje":              ("floor",             str),
+        "Boligtype":           ("property_type",     str),
+        "Eiendomstype":        ("property_type",     str),
+        "Prisantydning":       ("listing_price",     parse_int),
+        "Fellesgjeld":         ("collective_debt",   parse_int),
+        "Totalpris":           ("total_price",       parse_int),
+        "Pris per m²":         ("price_per_sqm",     parse_int),
+        "Ansvarlig megler":    ("realtor_name",      str),
+        "Megler":              ("realtor_name",      str),
+        "Meglerkontor":        ("realtor_agency",    str),
+    }
+
+    for label, (field, transform) in fields.items():
+        if not data.get(field):
+            val = find_value_after_label(label, transform)
+            if val:
+                data[field] = val
+
+    # Energimerke — "Energimerking\nD" mønster
+    if not data.get("energy_rating"):
+        val = find_value_after_label("Energimerking")
+        if val:
+            m = re.search(r"[A-G]", val.upper())
+            if m:
+                data["energy_rating"] = m.group()
+
+    # Beskrivelse — første lange tekstblokk
+    if not data.get("description"):
+        for i, line in enumerate(lines):
+            if len(line) > 150:
+                desc_lines = []
+                for l in lines[i:i+10]:
+                    if len(l) > 30:
+                        desc_lines.append(l)
+                    elif desc_lines:
+                        break
+                data["description"] = " ".join(desc_lines)[:3000]
+                break
+
+    # Bilder
+    if not data.get("images"):
+        imgs = set()
+        for img in soup.find_all("img"):
+            src = img.get("src") or img.get("data-src", "")
+            if src and "finncdn" in src and "logo" not in src.lower():
+                src = re.sub(r"\?.*", "", src)
+                imgs.add(src)
+        if imgs:
+            data["images"] = ", ".join(sorted(imgs)[:20])
+
+    # Sist oppdatert
+    if not data.get("last_updated_finn"):
+        m = re.search(r"[Oo]ppdatert[:\s]+(\d{1,2}\.\d{1,2}\.\d{4})", full_text)
+        if m:
+            data["last_updated_finn"] = m.group(1)
+
+    # Navn fallback
+    if not data.get("name"):
+        data["name"] = data.get("address", finn_id)
+
+    log.info(f"  Detaljer {finn_id}: pris={data.get('listing_price','?')} bra={data.get('usable_area_sqm','?')} bad={data.get('bathrooms','?')}")
+    return data
 
 
 def get_listing_details(finn_id: str, url: str) -> Dict:
@@ -321,34 +517,89 @@ def get_listing_details(finn_id: str, url: str) -> Dict:
                 kv[cells[0].get_text(strip=True).lower().strip(":")] = cells[1].get_text(strip=True)
 
         label_map = {
-            "prisantydning":     ("listing_price",    parse_int),
-            "fellesgjeld":       ("collective_debt",   parse_int),
-            "totalpris":         ("total_price",       parse_int),
-            "pris per m²":       ("price_per_sqm",     parse_int),
-            "pris per m2":       ("price_per_sqm",     parse_int),
-            "primærrom":         ("primary_area_sqm",  parse_int),
-            "p-rom":             ("primary_area_sqm",  parse_int),
-            "bruksareal":        ("usable_area_sqm",   parse_int),
-            "bra":               ("usable_area_sqm",   parse_int),
-            "tomteareal":        ("plot_size_sqm",     parse_int),
-            "tomtestørrelse":    ("plot_size_sqm",     parse_int),
-            "tomt":              ("plot_size_sqm",     parse_int),
-            "soverom":           ("bedrooms",          parse_int),
-            "antall soverom":    ("bedrooms",          parse_int),
-            "bad":               ("bathrooms",         parse_int),
-            "antall bad":        ("bathrooms",         parse_int),
-            "antall bad/wc":     ("bathrooms",         parse_int),
-            "byggeår":           ("year_built",        parse_int),
-            "etasje":            ("floor",             str),
-            "eiendomstype":      ("property_type",     str),
-            "boligtype":         ("property_type",     str),
-            "energimerking":     ("energy_rating",     lambda x: x[0].upper() if x else None),
-            "energimerke":       ("energy_rating",     lambda x: x[0].upper() if x else None),
-            "ansvarlig megler":  ("realtor_name",      str),
-            "megler":            ("realtor_name",      str),
-            "meglerkontor":      ("realtor_agency",    str),
-            "meglerfirma":       ("realtor_agency",    str),
+            "prisantydning":          ("listing_price",    parse_int),
+            "fellesgjeld":            ("collective_debt",   parse_int),
+            "totalpris":              ("total_price",       parse_int),
+            "pris per m²":            ("price_per_sqm",     parse_int),
+            "pris per m2":            ("price_per_sqm",     parse_int),
+            # Finn.no bruker nå "Internt bruksareal" istedet for "Primærrom"
+            "internt bruksareal":     ("primary_area_sqm",  parse_int),
+            "primærrom":              ("primary_area_sqm",  parse_int),
+            "p-rom":                  ("primary_area_sqm",  parse_int),
+            "bruksareal":             ("usable_area_sqm",   parse_int),
+            "bra":                    ("usable_area_sqm",   parse_int),
+            "tomteareal":             ("plot_size_sqm",     parse_int),
+            "tomtestørrelse":         ("plot_size_sqm",     parse_int),
+            "tomt":                   ("plot_size_sqm",     parse_int),
+            "soverom":                ("bedrooms",          parse_int),
+            "antall soverom":         ("bedrooms",          parse_int),
+            "bad":                    ("bathrooms",         parse_int),
+            "antall bad":             ("bathrooms",         parse_int),
+            "antall bad/wc":          ("bathrooms",         parse_int),
+            "rom":                    ("bathrooms",         parse_int),
+            "byggeår":                ("year_built",        parse_int),
+            "etasje":                 ("floor",             str),
+            "etasje i bygg":          ("floor",             str),
+            "eiendomstype":           ("property_type",     str),
+            "boligtype":              ("property_type",     str),
+            "energimerking":          ("energy_rating",     lambda x: x[0].upper() if x else None),
+            "energimerke":            ("energy_rating",     lambda x: x[0].upper() if x else None),
+            "ansvarlig megler":       ("realtor_name",      str),
+            "megler":                 ("realtor_name",      str),
+            "meglerkontor":           ("realtor_agency",    str),
+            "meglerfirma":            ("realtor_agency",    str),
         }
+        # Pris — ofte utenfor nøkkelinfo-tabellen, søk spesifikt
+        if not data.get("listing_price"):
+            for sel in [
+                "[class*='price'] [class*='amount']",
+                "[class*='Price'] span",
+                "[data-testid*='price']",
+                "span[class*='price']",
+                "div[class*='price']",
+            ]:
+                el = soup.select_one(sel)
+                if el:
+                    val = parse_int(el.get_text())
+                    if val and val > 100_000:
+                        data["listing_price"] = val
+                        break
+
+        # Energimerke — vises som ikon/bilde, hent fra alt-tekst eller aria-label
+        if not data.get("energy_rating"):
+            for sel in [
+                "[class*='energy'] [aria-label]",
+                "[class*='Energy'] [aria-label]",
+                "img[alt*='Energimerke']",
+                "[class*='energi']",
+            ]:
+                el = soup.select_one(sel)
+                if el:
+                    label = el.get("aria-label") or el.get("alt") or el.get_text()
+                    match = re.search(r"[A-G]", label.upper())
+                    if match:
+                        data["energy_rating"] = match.group()
+                        break
+
+        # Megler — let i kontaktkort
+        if not data.get("realtor_name"):
+            for sel in [
+                "[class*='ContactCard']",
+                "[class*='contact-card']",
+                "[class*='BrokerCard']",
+                "[class*='broker-card']",
+                "[class*='MeglerCard']",
+                "[class*='agent']",
+            ]:
+                card = soup.select_one(sel)
+                if card:
+                    name_el = card.select_one("strong, b, h2, h3, [class*='name'], [class*='Name']")
+                    agency_el = card.select_one("[class*='company'], [class*='office'], [class*='agency'], p")
+                    if name_el:
+                        data["realtor_name"] = name_el.get_text(strip=True)
+                    if agency_el:
+                        data["realtor_agency"] = agency_el.get_text(strip=True)
+                    break
         for label, (field, transform) in label_map.items():
             if label in kv and not data.get(field):
                 try:
