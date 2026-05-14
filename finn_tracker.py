@@ -222,15 +222,14 @@ def get_listing_details(finn_id: str, url: str) -> Dict:
         except Exception:
             pass
 
-    # ── Bilder ─────────────────────────────────────────────────────────────
+    # ── Bilder (lagret som kommaseparerte URL-er i tekstfelt) ────────────
     imgs = set()
     for img in soup.select("img[src*='images.finn']") + soup.select("img[data-src*='images.finn']"):
         src = img.get("src") or img.get("data-src", "")
         if src:
-            # Hent høyoppløselig versjon
             src = re.sub(r"\?.*", "", src)
             imgs.add(src)
-    data["images"] = ", ".join(imgs)
+    data["images"] = ", ".join(sorted(imgs))
 
     # ── Nøkkelinfo fra definisjonslister (dl/dt/dd) ───────────────────────
     kv: Dict[str, str] = {}
@@ -252,29 +251,34 @@ def get_listing_details(finn_id: str, url: str) -> Dict:
 
     # ── Map norske etiketter → databasefelt ──────────────────────────────
     label_map = {
-        "prisantydning":        ("listing_price",   parse_int),
-        "fellesgjeld":          ("collective_debt",  parse_int),
-        "totalpris":            ("total_price",      parse_int),
-        "pris per m²":          ("price_per_sqm",    parse_int),
-        "pris per m2":          ("price_per_sqm",    parse_int),
-        "primærrom":            ("primary_area_sqm", parse_int),
-        "primærrom (p-rom)":    ("primary_area_sqm", parse_int),
-        "bruksareal":           ("usable_area_sqm",  parse_int),
-        "bruksareal (bra)":     ("usable_area_sqm",  parse_int),
-        "tomteareal":           ("plot_size_sqm",    parse_int),
-        "tomtestørrelse":       ("plot_size_sqm",    parse_int),
-        "hageareale":           ("garden_size_sqm",  parse_int),
-        "hage":                 ("garden_size_sqm",  parse_int),
-        "hagestørrelse":        ("garden_size_sqm",  parse_int),
-        "soverom":              ("bedrooms",         parse_int),
-        "antall soverom":       ("bedrooms",         parse_int),
-        "bad":                  ("bathrooms",        parse_int),
-        "antall bad":           ("bathrooms",        parse_int),
-        "byggeår":              ("year_built",       parse_int),
-        "etasje":               ("floor",            str),
-        "eiendomstype":         ("property_type",    str),
-        "energimerking":        ("energy_rating",    lambda x: x[0].upper() if x else None),
-        "energimerke":          ("energy_rating",    lambda x: x[0].upper() if x else None),
+        "prisantydning":            ("listing_price",   parse_int),
+        "fellesgjeld":              ("collective_debt",  parse_int),
+        "totalpris":                ("total_price",      parse_int),
+        "pris per m²":              ("price_per_sqm",    parse_int),
+        "pris per m2":              ("price_per_sqm",    parse_int),
+        "primærrom":                ("primary_area_sqm", parse_int),
+        "primærrom (p-rom)":        ("primary_area_sqm", parse_int),
+        "p-rom":                    ("primary_area_sqm", parse_int),
+        "bruksareal":               ("usable_area_sqm",  parse_int),
+        "bruksareal (bra)":         ("usable_area_sqm",  parse_int),
+        "bra":                      ("usable_area_sqm",  parse_int),
+        "tomteareal":               ("plot_size_sqm",    parse_int),
+        "tomtestørrelse":           ("plot_size_sqm",    parse_int),
+        "tomt":                     ("plot_size_sqm",    parse_int),
+        "soverom":                  ("bedrooms",         parse_int),
+        "antall soverom":           ("bedrooms",         parse_int),
+        "bad":                      ("bathrooms",        parse_int),
+        "antall bad":               ("bathrooms",        parse_int),
+        "antall bad/wc":            ("bathrooms",        parse_int),
+        "wc":                       ("bathrooms",        parse_int),
+        "byggeår":                  ("year_built",       parse_int),
+        "etasje":                   ("floor",            str),
+        "etasje i bygg":            ("floor",            str),
+        "eiendomstype":             ("property_type",    str),
+        "boligtype":                ("property_type",    str),
+        "type eiendom":             ("property_type",    str),
+        "energimerking":            ("energy_rating",    lambda x: x[0].upper() if x else None),
+        "energimerke":              ("energy_rating",    lambda x: x[0].upper() if x else None),
     }
 
     for label, (field, transform) in label_map.items():
@@ -306,16 +310,34 @@ def get_listing_details(finn_id: str, url: str) -> Dict:
     data["name"] = name if name else data.get("address", "")
 
     # ── Megler ──────────────────────────────────────────────────────────
-    for sel in ["[class*='realtor']", "[class*='broker']", "[class*='megler']", "[class*='agent']"]:
+    # Prøv strukturerte seksjoner først
+    realtor_found = False
+    for sel in [
+        "[class*='realtor']", "[class*='broker']",
+        "[class*='megler']", "[class*='agent']",
+        "[class*='contact']", "[class*='ContactCard']",
+    ]:
         section = soup.select_one(sel)
         if section:
-            name_el = section.select_one("strong, b, [class*='name']")
-            agency_el = section.select_one("p, [class*='company'], [class*='agency']")
+            name_el = section.select_one("strong, b, h2, h3, [class*='name']")
+            agency_el = section.select_one("p, [class*='company'], [class*='agency'], [class*='office']")
             if name_el:
                 data["realtor_name"] = name_el.get_text(strip=True)
+                realtor_found = True
             if agency_el:
                 data["realtor_agency"] = agency_el.get_text(strip=True)
             break
+
+    # Fallback: let i kv-parene etter meglernavn
+    if not realtor_found:
+        for label in ["ansvarlig megler", "megler", "kontaktperson", "kontakt"]:
+            if label in kv:
+                data["realtor_name"] = kv[label]
+                break
+        for label in ["meglerkontor", "meglerfirma", "kontor", "foretaksnavn"]:
+            if label in kv:
+                data["realtor_agency"] = kv[label]
+                break
 
     # ── Beskrivelse fallback ─────────────────────────────────────────────
     if not data.get("description"):
