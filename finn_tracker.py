@@ -74,7 +74,7 @@ def parse_int(text: str) -> Optional[int]:
 
 
 def fetch_via_firecrawl(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
-    """Henter side via Firecrawl — omgår geo-blokkering og anti-bot."""
+    """Henter side via Firecrawl med full JS-rendering."""
     for attempt in range(retries):
         try:
             resp = requests.post(
@@ -83,15 +83,23 @@ def fetch_via_firecrawl(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
                     "Authorization": f"Bearer {FIRECRAWL_KEY}",
                     "Content-Type": "application/json",
                 },
-                json={"url": url, "formats": ["html"]},
-                timeout=60,
+                json={
+                    "url": url,
+                    "formats": ["html"],
+                    "waitFor": 4000,
+                    "onlyMainContent": False,
+                },
+                timeout=90,
             )
             resp.raise_for_status()
             data = resp.json()
             html = data.get("data", {}).get("html", "")
             if html:
-                return BeautifulSoup(html, "html.parser")
-            log.warning(f"Firecrawl returnerte tom HTML for {url}")
+                soup = BeautifulSoup(html, "html.parser")
+                articles = soup.find_all("article")
+                log.info(f"  Firecrawl: {len(html)} tegn HTML, {len(articles)} article-elementer")
+                return soup
+            log.warning(f"Firecrawl returnerte tom HTML for {url} — svar: {str(data)[:200]}")
         except Exception as e:
             log.warning(f"Firecrawl forsøk {attempt+1}/{retries} feilet: {url} — {e}")
             time.sleep(5)
