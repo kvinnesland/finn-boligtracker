@@ -195,7 +195,7 @@ def get_search_listing_ids() -> List[Dict]:
 
 
 def get_listing_details(finn_id: str, url: str) -> Dict:
-    """Scraper full informasjon fra en enkelt annonseside."""
+    """Scraper full informasjon fra en enkelt Finn.no annonseside."""
     if not url:
         url = f"https://www.finn.no/realestate/homes/ad.html?finnkode={finn_id}"
 
@@ -205,158 +205,201 @@ def get_listing_details(finn_id: str, url: str) -> Dict:
 
     data: Dict = {"finn_id": finn_id, "listing_url": url}
 
-    # ── JSON-LD strukturert data (mest pålitelig) ─────────────────────────
-    for script in soup.find_all("script", type="application/ld+json"):
+    # ── Steg 1: Hent __NEXT_DATA__ JSON (mest pålitelig på Next.js-sider) ──
+    next_data_tag = soup.find("script", id="__NEXT_DATA__")
+    if next_data_tag:
         try:
-            ld = json.loads(script.string or "")
-            if isinstance(ld, dict) and "@type" in ld:
-                addr = ld.get("address", {})
-                if isinstance(addr, dict):
-                    parts = [
-                        addr.get("streetAddress", ""),
-                        addr.get("addressLocality", ""),
-                    ]
-                    data["address"] = ", ".join(p for p in parts if p)
-                data["description"] = ld.get("description", "")[:3000]
-                break
-        except Exception:
-            pass
+            nd = json.loads(next_data_tag.string or "")
+            # Naviger ned i Next.js-strukturen
+            props = nd.get("props", {}).get("pageProps", {})
+            ad = props.get("ad", props.get("listing", props.get("data", {})))
 
-    # ── Bilder (lagret som kommaseparerte URL-er i tekstfelt) ────────────
-    imgs = set()
-    for img in soup.select("img[src*='images.finn']") + soup.select("img[data-src*='images.finn']"):
-        src = img.get("src") or img.get("data-src", "")
-        if src:
-            src = re.sub(r"\?.*", "", src)
-            imgs.add(src)
-    data["images"] = ", ".join(sorted(imgs))
+            # Adresse
+            location = ad.get("location", {})
+            if isinstance(location, dict):
+                parts = [
+                    location.get("address", ""),
+                    location.get("postalCode", ""),
+                    location.get("city", ""),
+                ]
+                data["address"] = " ".join(p for p in parts if p).strip()
+            elif isinstance(location, str):
+                data["address"] = location
 
-    # ── Nøkkelinfo fra definisjonslister (dl/dt/dd) ───────────────────────
-    kv: Dict[str, str] = {}
-    for dl in soup.select("dl"):
-        dts = dl.find_all("dt")
-        dds = dl.find_all("dd")
-        for dt, dd in zip(dts, dds):
-            key = dt.get_text(strip=True).lower().strip(":")
-            val = dd.get_text(strip=True)
-            kv[key] = val
+            # Beskrivelse
+            data["description"] = (ad.get("description") or ad.get("body") or "")[:3000]
 
-    # Prøv også tabellrader
-    for tr in soup.select("tr"):
-        cells = tr.find_all(["th", "td"])
-        if len(cells) >= 2:
-            key = cells[0].get_text(strip=True).lower().strip(":")
-            val = cells[1].get_text(strip=True)
-            kv[key] = val
+            # Priser
+            pricing = ad.get("pricing", ad.get("price", {}))
+            if isinstance(pricing, dict):
+                data["listing_price"]  = pricing.get("suggestion") or pricing.get("asking")
+                data["collective_debt"]= pricing.get("sharedDebt") or pricing.get("collectiveDebt")
+                data["total_price"]    = pricing.get("total")
+                data["price_per_sqm"]  = pricing.get("perSquareMeter") or pricing.get("pricePerSqm")
+            elif isinstance(pricing, (int, float)):
+                data["listing_price"] = int(pricing)
 
-    # ── Map norske etiketter → databasefelt ──────────────────────────────
-    label_map = {
-        "prisantydning":            ("listing_price",   parse_int),
-        "fellesgjeld":              ("collective_debt",  parse_int),
-        "totalpris":                ("total_price",      parse_int),
-        "pris per m²":              ("price_per_sqm",    parse_int),
-        "pris per m2":              ("price_per_sqm",    parse_int),
-        "primærrom":                ("primary_area_sqm", parse_int),
-        "primærrom (p-rom)":        ("primary_area_sqm", parse_int),
-        "p-rom":                    ("primary_area_sqm", parse_int),
-        "bruksareal":               ("usable_area_sqm",  parse_int),
-        "bruksareal (bra)":         ("usable_area_sqm",  parse_int),
-        "bra":                      ("usable_area_sqm",  parse_int),
-        "tomteareal":               ("plot_size_sqm",    parse_int),
-        "tomtestørrelse":           ("plot_size_sqm",    parse_int),
-        "tomt":                     ("plot_size_sqm",    parse_int),
-        "soverom":                  ("bedrooms",         parse_int),
-        "antall soverom":           ("bedrooms",         parse_int),
-        "bad":                      ("bathrooms",        parse_int),
-        "antall bad":               ("bathrooms",        parse_int),
-        "antall bad/wc":            ("bathrooms",        parse_int),
-        "wc":                       ("bathrooms",        parse_int),
-        "byggeår":                  ("year_built",       parse_int),
-        "etasje":                   ("floor",            str),
-        "etasje i bygg":            ("floor",            str),
-        "eiendomstype":             ("property_type",    str),
-        "boligtype":                ("property_type",    str),
-        "type eiendom":             ("property_type",    str),
-        "energimerking":            ("energy_rating",    lambda x: x[0].upper() if x else None),
-        "energimerke":              ("energy_rating",    lambda x: x[0].upper() if x else None),
-    }
+            # Areal
+            size = ad.get("size", ad.get("area", {}))
+            if isinstance(size, dict):
+                data["primary_area_sqm"] = size.get("primaryRoomArea") or size.get("primary") or size.get("prom")
+                data["usable_area_sqm"]  = size.get("usableArea") or size.get("bra") or size.get("usable")
+            plot = ad.get("plot", ad.get("plotArea", {}))
+            if isinstance(plot, dict):
+                data["plot_size_sqm"]   = plot.get("area") or plot.get("size")
+                data["garden_size_sqm"] = plot.get("gardenArea")
+            elif isinstance(plot, (int, float)):
+                data["plot_size_sqm"] = int(plot)
 
-    for label, (field, transform) in label_map.items():
-        if label in kv:
-            try:
-                val = transform(kv[label])
-                if val is not None:
-                    data[field] = val
-            except Exception:
-                data[field] = kv[label]
+            # Rom
+            data["bedrooms"]  = ad.get("bedrooms") or ad.get("numberOfBedrooms")
+            data["bathrooms"] = ad.get("bathrooms") or ad.get("numberOfBathrooms")
+            data["year_built"]= ad.get("constructionYear") or ad.get("yearBuilt")
+            data["floor"]     = str(ad.get("floor", "")) or None
+            data["property_type"] = ad.get("propertyType") or ad.get("estateType")
 
-    # ── Adresse fallback ─────────────────────────────────────────────────
-    if not data.get("address"):
-        h1 = soup.select_one("h1")
-        if h1:
-            data["address"] = h1.get_text(strip=True)
+            # Energimerke
+            energy = ad.get("energyLabel") or ad.get("energyRating") or ""
+            if energy:
+                data["energy_rating"] = str(energy)[0].upper()
 
-    # ── Navn på boligen ───────────────────────────────────────────────────
-    # Noen annonser har et eget navn (f.eks. "Villa Solheim")
-    # Finn det i h1 eller tittel-felt — hvis ikke, bruk adressen
-    name = None
+            # Megler
+            broker = ad.get("broker", ad.get("realtor", ad.get("agent", ad.get("contact", {}))))
+            if isinstance(broker, dict):
+                data["realtor_name"]   = broker.get("name") or broker.get("firstName","") + " " + broker.get("lastName","")
+                data["realtor_agency"] = broker.get("company") or broker.get("officeName") or broker.get("organization")
+
+            # Bilder
+            images = ad.get("images", ad.get("media", ad.get("photos", [])))
+            if isinstance(images, list):
+                urls = []
+                for img in images:
+                    if isinstance(img, dict):
+                        u = img.get("url") or img.get("src") or img.get("uri", "")
+                    elif isinstance(img, str):
+                        u = img
+                    else:
+                        u = ""
+                    if u:
+                        urls.append(u)
+                data["images"] = ", ".join(urls[:20])
+
+            log.info(f"  [JSON] {finn_id}: {data.get('address','?')} — {data.get('listing_price','?')} kr")
+        except Exception as e:
+            log.warning(f"  __NEXT_DATA__ parsing feilet for {finn_id}: {e}")
+
+    # ── Steg 2: Fallback — søk i alle script-tagger etter JSON med finnkode ──
+    if not data.get("listing_price"):
+        for script in soup.find_all("script"):
+            txt = script.string or ""
+            if finn_id in txt and ("prisantydning" in txt.lower() or "listingPrice" in txt or "askingPrice" in txt):
+                try:
+                    # Finn JSON-blobs i scriptet
+                    for match in re.finditer(r'\{[^{}]{200,}\}', txt):
+                        try:
+                            obj = json.loads(match.group())
+                            if str(finn_id) in str(obj):
+                                # Flatt søk etter kjente nøkler
+                                flat = json.dumps(obj).lower()
+                                if "price" in flat or "pris" in flat:
+                                    log.info(f"  Fant mulig prisdata i script-tag for {finn_id}")
+                                    break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+    # ── Steg 3: HTML kv-fallback for felt som mangler ──────────────────────
+    if not data.get("listing_price") or not data.get("address"):
+        kv: Dict[str, str] = {}
+        for dl in soup.select("dl"):
+            for dt, dd in zip(dl.find_all("dt"), dl.find_all("dd")):
+                kv[dt.get_text(strip=True).lower().strip(":")] = dd.get_text(strip=True)
+        for tr in soup.select("tr"):
+            cells = tr.find_all(["th", "td"])
+            if len(cells) >= 2:
+                kv[cells[0].get_text(strip=True).lower().strip(":")] = cells[1].get_text(strip=True)
+
+        label_map = {
+            "prisantydning":     ("listing_price",    parse_int),
+            "fellesgjeld":       ("collective_debt",   parse_int),
+            "totalpris":         ("total_price",       parse_int),
+            "pris per m²":       ("price_per_sqm",     parse_int),
+            "pris per m2":       ("price_per_sqm",     parse_int),
+            "primærrom":         ("primary_area_sqm",  parse_int),
+            "p-rom":             ("primary_area_sqm",  parse_int),
+            "bruksareal":        ("usable_area_sqm",   parse_int),
+            "bra":               ("usable_area_sqm",   parse_int),
+            "tomteareal":        ("plot_size_sqm",     parse_int),
+            "tomtestørrelse":    ("plot_size_sqm",     parse_int),
+            "tomt":              ("plot_size_sqm",     parse_int),
+            "soverom":           ("bedrooms",          parse_int),
+            "antall soverom":    ("bedrooms",          parse_int),
+            "bad":               ("bathrooms",         parse_int),
+            "antall bad":        ("bathrooms",         parse_int),
+            "antall bad/wc":     ("bathrooms",         parse_int),
+            "byggeår":           ("year_built",        parse_int),
+            "etasje":            ("floor",             str),
+            "eiendomstype":      ("property_type",     str),
+            "boligtype":         ("property_type",     str),
+            "energimerking":     ("energy_rating",     lambda x: x[0].upper() if x else None),
+            "energimerke":       ("energy_rating",     lambda x: x[0].upper() if x else None),
+            "ansvarlig megler":  ("realtor_name",      str),
+            "megler":            ("realtor_name",      str),
+            "meglerkontor":      ("realtor_agency",    str),
+            "meglerfirma":       ("realtor_agency",    str),
+        }
+        for label, (field, transform) in label_map.items():
+            if label in kv and not data.get(field):
+                try:
+                    val = transform(kv[label])
+                    if val is not None:
+                        data[field] = val
+                except Exception:
+                    data[field] = kv[label]
+
+        # Adresse fallback fra h1
+        if not data.get("address"):
+            h1 = soup.select_one("h1")
+            if h1:
+                data["address"] = h1.get_text(strip=True)
+
+        # Beskrivelse fallback
+        if not data.get("description"):
+            for sel in ["[class*='description']", "[class*='ingress']", "article p"]:
+                el = soup.select_one(sel)
+                if el and len(el.get_text(strip=True)) > 50:
+                    data["description"] = el.get_text(strip=True)[:3000]
+                    break
+
+    # ── Bilder fallback fra img-tagger ─────────────────────────────────────
+    if not data.get("images"):
+        imgs = set()
+        for img in soup.select("img[src*='finn']") + soup.select("img[data-src*='finn']"):
+            src = img.get("src") or img.get("data-src", "")
+            if src and ("image" in src or "photo" in src or "media" in src):
+                src = re.sub(r"\?.*", "", src)
+                imgs.add(src)
+        if imgs:
+            data["images"] = ", ".join(sorted(imgs)[:20])
+
+    # ── Sist oppdatert ─────────────────────────────────────────────────────
+    if not data.get("last_updated_finn"):
+        match = re.search(r"[Oo]ppdatert[:\s]+(\d{1,2}\.\d{1,2}\.\d{4})", soup.get_text())
+        if match:
+            data["last_updated_finn"] = match.group(1)
+
+    # ── Navn ───────────────────────────────────────────────────────────────
     h1 = soup.select_one("h1")
     if h1:
         candidate = h1.get_text(strip=True)
         address = data.get("address", "")
-        # Hvis h1 er forskjellig fra adressen, er det trolig et husnavn
-        if candidate and candidate != address:
-            name = candidate
-    data["name"] = name if name else data.get("address", "")
+        data["name"] = candidate if (candidate and candidate != address) else address
 
-    # ── Megler ──────────────────────────────────────────────────────────
-    # Prøv strukturerte seksjoner først
-    realtor_found = False
-    for sel in [
-        "[class*='realtor']", "[class*='broker']",
-        "[class*='megler']", "[class*='agent']",
-        "[class*='contact']", "[class*='ContactCard']",
-    ]:
-        section = soup.select_one(sel)
-        if section:
-            name_el = section.select_one("strong, b, h2, h3, [class*='name']")
-            agency_el = section.select_one("p, [class*='company'], [class*='agency'], [class*='office']")
-            if name_el:
-                data["realtor_name"] = name_el.get_text(strip=True)
-                realtor_found = True
-            if agency_el:
-                data["realtor_agency"] = agency_el.get_text(strip=True)
-            break
+    if not data.get("name"):
+        data["name"] = data.get("address", finn_id)
 
-    # Fallback: let i kv-parene etter meglernavn
-    if not realtor_found:
-        for label in ["ansvarlig megler", "megler", "kontaktperson", "kontakt"]:
-            if label in kv:
-                data["realtor_name"] = kv[label]
-                break
-        for label in ["meglerkontor", "meglerfirma", "kontor", "foretaksnavn"]:
-            if label in kv:
-                data["realtor_agency"] = kv[label]
-                break
-
-    # ── Beskrivelse fallback ─────────────────────────────────────────────
-    if not data.get("description"):
-        for sel in ["[class*='description']", "[class*='ingress']", "[class*='body']"]:
-            el = soup.select_one(sel)
-            if el and len(el.get_text(strip=True)) > 50:
-                data["description"] = el.get_text(strip=True)[:3000]
-                break
-
-    # ── Sist oppdatert på Finn ───────────────────────────────────────────
-    page_text = soup.get_text()
-    match = re.search(r"[Oo]ppdatert[:\s]+(\d{1,2}\.\d{1,2}\.\d{4})", page_text)
-    if match:
-        data["last_updated_finn"] = match.group(1)
-
-    log.info(
-        f"  Scraped {finn_id}: {data.get('address', '(ingen adresse)')} "
-        f"— {data.get('listing_price', '?')} kr"
-    )
+    log.info(f"  Scraped {finn_id}: {data.get('address','(ingen adresse)')} — {data.get('listing_price','?')} kr")
     return data
 
 
