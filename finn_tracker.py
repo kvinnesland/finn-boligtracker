@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Finn.no Boligtracker v1.0
+Finn.no Boligtracker v1.1
 Scraper → Airtable database + e-post oppsummering
+Bruker Firecrawl for å omgå geo-blokkering fra GitHub Actions
 """
 
 import os, re, time, json, smtplib, logging
@@ -34,13 +35,16 @@ AT_BASE_ID   = os.getenv("AIRTABLE_BASE_ID")
 AT_PROPS_TBL = os.getenv("AIRTABLE_PROPERTIES_TABLE_ID")
 AT_CHG_TBL   = os.getenv("AIRTABLE_CHANGES_TABLE_ID")
 
-EMAIL_FROM  = os.getenv("EMAIL_SENDER")
-EMAIL_PASS  = os.getenv("EMAIL_PASSWORD")
-EMAIL_TO    = os.getenv("EMAIL_RECIPIENT")
-SMTP_HOST   = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT   = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+EMAIL_FROM   = os.getenv("EMAIL_SENDER")
+EMAIL_PASS   = os.getenv("EMAIL_PASSWORD")
+EMAIL_TO     = [r.strip() for r in os.getenv("EMAIL_RECIPIENT", "").split(",") if r.strip()]
+SMTP_HOST    = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT    = int(os.getenv("EMAIL_SMTP_PORT", "587"))
 
-REQUEST_DELAY = 1.5  # sekunder mellom requests
+FIRECRAWL_KEY = os.getenv("FIRECRAWL_API_KEY")
+FIRECRAWL_URL = "https://api.firecrawl.dev/v1/scrape"
+
+REQUEST_DELAY = 2.0  # sekunder mellom requests
 
 HEADERS = {
     "User-Agent": (
@@ -69,15 +73,50 @@ def parse_int(text: str) -> Optional[int]:
     return int(cleaned) if cleaned else None
 
 
-def fetch(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
+def fetch_via_firecrawl(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
+    """Henter side via Firecrawl — omgår geo-blokkering og anti-bot."""
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                FIRECRAWL_URL,
+                headers={
+                    "Authorization": f"Bearer {FIRECRAWL_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"url": url, "formats": ["html"]},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            html = data.get("data", {}).get("html", "")
+            if html:
+                return BeautifulSoup(html, "html.parser")
+            log.warning(f"Firecrawl returnerte tom HTML for {url}")
+        except Exception as e:
+            log.warning(f"Firecrawl forsøk {attempt+1}/{retries} feilet: {url} — {e}")
+            time.sleep(5)
+    return None
+
+
+def fetch_direct(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
+    """Direkte HTTP-henting — brukes for eiendomsverdi.no."""
     for attempt in range(retries):
         try:
             r = requests.get(url, headers=HEADERS, timeout=25)
             r.raise_for_status()
             return BeautifulSoup(r.text, "html.parser")
         except Exception as e:
-            log.warning(f"Fetch forsøk {attempt+1}/{retries} feilet: {url} — {e}")
+            log.warning(f"Direkte fetch forsøk {attempt+1}/{retries} feilet: {url} — {e}")
             time.sleep(4)
+    return None
+
+
+def fetch(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
+    """Bruker Firecrawl hvis nøkkel finnes, ellers direkte."""
+    if FIRECRAWL_KEY:
+        return fetch_via_firecrawl(url, retries)
+    return fetch_direct(url, retries)
+
     log.error(f"Kunne ikke hente: {url}")
     return None
 
@@ -583,7 +622,7 @@ def send_email(summary: Dict):
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"Finn.no Bolig — {summary['run_ts']}"
         msg["From"] = EMAIL_FROM
-        msg["To"] = EMAIL_TO
+        msg["To"] = ", ".join(EMAIL_TO)
         msg.attach(MIMEText(html, "html", "utf-8"))
 
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
