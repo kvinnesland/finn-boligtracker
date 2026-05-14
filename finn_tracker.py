@@ -411,7 +411,7 @@ def get_listing_details(finn_id: str, url: str, base_data: Dict = None) -> Dict:
     return data
 
 
-def get_listing_details(finn_id: str, url: str) -> Dict:
+def get_listing_details(finn_id: str, url: str, base_data: Dict = None) -> Dict:
     """Scraper full informasjon fra en enkelt Finn.no annonseside."""
     if not url:
         url = f"https://www.finn.no/realestate/homes/ad.html?finnkode={finn_id}"
