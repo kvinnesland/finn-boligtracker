@@ -261,25 +261,29 @@ def extract_card_data(finn_id: str, url: str, element) -> Dict:
             data["bedrooms"] = int(m.group(1))
             break
 
-    # Meglernavn — logo img alt-tekst eller tekst nær logoen
-    megler_img = element.select_one("img[alt*='logo'], img[alt*='Megler'], img[alt*='megler']")
+    # Meglernavn — hent tekst som følger direkte etter megler-logo img-taggen
+    megler_img = element.select_one("img[alt*='logo'], img[alt*='Logo'], img[src*='logo']")
     if megler_img:
-        alt = megler_img.get("alt", "")
-        if "logo" in alt.lower():
-            # Hent tekst rett etter logoen
-            parent = megler_img.find_parent()
-            if parent:
-                sibling_text = parent.get_text(strip=True)
-                if sibling_text and len(sibling_text) > 3:
-                    data["realtor_agency"] = sibling_text
-    
-    # Fallback megler fra tekst
+        # Naviger opp til forelder og hent tekst etter img
+        next_sib = megler_img.next_sibling
+        while next_sib:
+            if hasattr(next_sib, 'get_text'):
+                txt = next_sib.get_text(strip=True)
+            else:
+                txt = str(next_sib).strip()
+            if txt and len(txt) > 3:
+                data["realtor_agency"] = txt
+                break
+            next_sib = next_sib.next_sibling
+
+    # Fallback: søk i alle linjer etter kjente meglerord
     if not data.get("realtor_agency"):
         for line in lines:
-            if any(word in line for word in ["Eiendomsmegling", "Eiendomsmegler", "Megling",
-                                              "Advokatfirma", "Eiendom AS"]):
-                data["realtor_agency"] = line
-                break
+            if any(word in line for word in ["Eiendomsmegling", "Eiendomsmegler",
+                                              "Megling", "Advokatfirma", "Eiendom"]):
+                if len(line) < 60:  # ikke for lang linje
+                    data["realtor_agency"] = line
+                    break
 
     # Solgt-status fra søkelisten
     if any("solgt" in l.lower() for l in lines[:5]):
@@ -352,18 +356,35 @@ def get_listing_details(finn_id: str, url: str, base_data: Dict = None) -> Dict:
             if m:
                 data["energy_rating"] = m.group()
 
-    # Beskrivelse — første lange tekstblokk
+    # Beskrivelse — finn faktisk boligbeskrivelse, ikke meglerens markedsføring
+    SKIP_PATTERNS = [
+        "eiendomsmegling", "eiendomsmegler", "meglerfirma",
+        "skal du både kjøpe", "kontakt oss", "ring oss",
+        "vi hjelper deg", "garanti", "advokatfirma",
+        "finn.no", "cookie", "javascript",
+    ]
     if not data.get("description"):
+        # Let etter linjen som starter boligbeskrivelsen
+        # Den kommer typisk etter nøkkelinfo-seksjonen
+        nøkkel_seen = False
+        desc_lines = []
         for i, line in enumerate(lines):
-            if len(line) > 150:
-                desc_lines = []
-                for l in lines[i:i+10]:
-                    if len(l) > 30:
-                        desc_lines.append(l)
-                    elif desc_lines:
-                        break
-                data["description"] = " ".join(desc_lines)[:3000]
+            # Marker at vi har passert nøkkelinfo
+            if any(k in line.lower() for k in ["byggeår", "bruksareal", "tomteareal", "prisantydning"]):
+                nøkkel_seen = True
+            if not nøkkel_seen:
+                continue
+            # Skip linjer som ser ut som meglertekst
+            if any(p in line.lower() for p in SKIP_PATTERNS):
+                continue
+            # Skip korte linjer og lenker
+            if len(line) < 60 or line.startswith("http"):
+                continue
+            desc_lines.append(line)
+            if len(desc_lines) >= 5:
                 break
+        if desc_lines:
+            data["description"] = " ".join(desc_lines)[:3000]
 
     # Bilder
     if not data.get("images"):
@@ -765,7 +786,7 @@ def run():
         log.info(f"[{i}/{len(search_results)}] Behandler {finn_id}")
         time.sleep(REQUEST_DELAY)
 
-        details = get_listing_details(finn_id, url)
+        details = get_listing_details(finn_id, url, base_data=item)
 
         if details.get("_error"):
             summary["errors"].append(f"Kunne ikke hente annonse {finn_id} ({url})")
