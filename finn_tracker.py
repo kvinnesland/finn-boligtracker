@@ -132,7 +132,7 @@ def fetch(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
 # ── FINN.NO SCRAPING ─────────────────────────────────────────────────────────
 
 def get_search_listing_ids() -> List[Dict]:
-    """Henter alle finn_id + URL fra søkesiden (alle sider)."""
+    """Henter alle finn_id + URL fra søkesiden via finnkode i lenker."""
     listings = []
     page = 1
 
@@ -145,38 +145,29 @@ def get_search_listing_ids() -> List[Dict]:
             log.error(f"Klarte ikke hente søkeside {page} — avslutter paginering")
             break
 
-        # Finn.no bruker article-elementer med id="id-XXXXXXXX"
-        articles = soup.select("article[id^='id-']")
+        # Finn alle lenker som inneholder finnkode= i href
+        all_links = soup.find_all("a", href=re.compile(r"finnkode=\d+"))
+        log.info(f"  Fant {len(all_links)} lenker med finnkode på side {page}")
 
-        if not articles:
-            # Fallback: prøv andre selektorer
-            articles = soup.select("article[data-testid]") or soup.select("article")
+        seen_on_page = set()
+        for link in all_links:
+            href = link.get("href", "")
+            match = re.search(r"finnkode=(\d+)", href)
+            if not match:
+                continue
+            finn_id = match.group(1)
+            if finn_id in seen_on_page:
+                continue
+            seen_on_page.add(finn_id)
 
-        if not articles:
-            log.info(f"Ingen flere annonser på side {page}")
+            full_url = href if href.startswith("http") else "https://www.finn.no" + href
+            listings.append({"finn_id": finn_id, "listing_url": full_url})
+
+        log.info(f"  {len(seen_on_page)} unike annonser på side {page}")
+
+        if not seen_on_page:
+            log.info(f"Ingen annonser funnet på side {page} — stopper paginering")
             break
-
-        found_on_page = 0
-        for article in articles:
-            # Hent finn_id fra article id
-            raw_id = article.get("id", "")
-            finn_id = re.sub(r"[^0-9]", "", raw_id)
-
-            # Hent URL til annonsen
-            link = (
-                article.select_one("a[href*='finnkode']")
-                or article.select_one("a[href*='/realestate/']")
-                or article.find("a", href=True)
-            )
-            href = link["href"] if link else None
-            if href and not href.startswith("http"):
-                href = "https://www.finn.no" + href
-
-            if finn_id:
-                listings.append({"finn_id": finn_id, "listing_url": href})
-                found_on_page += 1
-
-        log.info(f"  Fant {found_on_page} annonser på side {page}")
 
         # Sjekk om det finnes neste side
         next_btn = (
@@ -185,13 +176,22 @@ def get_search_listing_ids() -> List[Dict]:
             or soup.select_one("[data-testid='pagination-next-page']")
         )
         if not next_btn or not next_btn.get("href"):
+            log.info(f"Ingen neste side funnet — ferdig med paginering")
             break
 
         page += 1
         time.sleep(REQUEST_DELAY)
 
-    log.info(f"Totalt {len(listings)} annonser funnet")
-    return listings
+    # Dedupliser på tvers av sider
+    seen = set()
+    unique = []
+    for item in listings:
+        if item["finn_id"] not in seen:
+            seen.add(item["finn_id"])
+            unique.append(item)
+
+    log.info(f"Totalt {len(unique)} unike annonser funnet")
+    return unique
 
 
 def get_listing_details(finn_id: str, url: str) -> Dict:
@@ -291,6 +291,19 @@ def get_listing_details(finn_id: str, url: str) -> Dict:
         h1 = soup.select_one("h1")
         if h1:
             data["address"] = h1.get_text(strip=True)
+
+    # ── Navn på boligen ───────────────────────────────────────────────────
+    # Noen annonser har et eget navn (f.eks. "Villa Solheim")
+    # Finn det i h1 eller tittel-felt — hvis ikke, bruk adressen
+    name = None
+    h1 = soup.select_one("h1")
+    if h1:
+        candidate = h1.get_text(strip=True)
+        address = data.get("address", "")
+        # Hvis h1 er forskjellig fra adressen, er det trolig et husnavn
+        if candidate and candidate != address:
+            name = candidate
+    data["name"] = name if name else data.get("address", "")
 
     # ── Megler ──────────────────────────────────────────────────────────
     for sel in ["[class*='realtor']", "[class*='broker']", "[class*='megler']", "[class*='agent']"]:
@@ -394,7 +407,7 @@ TRACKED_FIELDS = [
     "primary_area_sqm", "usable_area_sqm", "plot_size_sqm", "garden_size_sqm",
     "bedrooms", "bathrooms", "year_built", "floor", "property_type",
     "energy_rating", "realtor_name", "realtor_agency", "images",
-    "last_updated_finn", "status",
+    "last_updated_finn", "status", "name",
 ]
 
 
