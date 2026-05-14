@@ -1,0 +1,38 @@
+name: Finn.no Boligtracker
+
+on:
+  schedule:
+    # 08:00 norsk tid (UTC+2 sommer / UTC+1 vinter)
+    - cron: '0 6 * * *'   # 08:00 CEST (sommer)
+    - cron: '0 14 * * *'  # 16:00 CEST (sommer)
+  workflow_dispatch:  # Manuell kjøring fra GitHub-appen
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Hent kode
+        uses: actions/checkout@v4
+
+      - name: Sett opp Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Installer avhengigheter
+        run: pip install -r requirements.txt
+
+      - name: Kjør Finn.no tracker
+        env:
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_PROPERTIES_TABLE_ID: ${{ secrets.AIRTABLE_PROPERTIES_TABLE_ID }}
+          AIRTABLE_CHANGES_TABLE_ID: ${{ secrets.AIRTABLE_CHANGES_TABLE_ID }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          EMAIL_SMTP_HOST: smtp.gmail.com
+          EMAIL_SMTP_PORT: '587'
+        run: python finn_tracker.py
